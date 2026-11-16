@@ -1,0 +1,15 @@
+services:
+  tunnel-trips:
+    build: .
+    image: tunnel-trips:local
+    container_name: tunnel-trips
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/trips.db
+    volumes:
+      - trips-data:/data
+    restart: unless-stopped
+
+volumes:
+  trips-data:
