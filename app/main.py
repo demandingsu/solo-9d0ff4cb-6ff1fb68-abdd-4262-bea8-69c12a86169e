@@ -23,6 +23,7 @@ from .pairing import (
     Trip,
     pair_observations,
 )
+from .verification import verify_snapshot
 
 logger = logging.getLogger("tunnel_trips")
 logging.basicConfig(
@@ -93,6 +94,61 @@ class UploadOut(RoundOut):
     )
 
 
+class DigestCheckOut(BaseModel):
+    radar: str = Field(description="雷达：entry 或 exit")
+    filename: str = Field(description="入库时记录的原始文件名")
+    recorded_sha256: str = Field(description="入库时记录的 SHA-256")
+    actual_sha256: str = Field(description="对库内原始文件 BLOB 重新计算的 SHA-256")
+    recorded_size_bytes: int = Field(description="入库时记录的字节数")
+    actual_size_bytes: int = Field(description="库内原始文件 BLOB 的实际字节数")
+    sha256_ok: bool = Field(description="重新计算的 SHA-256 是否与记录一致")
+    size_ok: bool = Field(description="实际字节数是否与记录一致")
+
+
+class DifferenceOut(BaseModel):
+    scope: str = Field(
+        description="差异范围：observation（观测）、trip（行程）或 summary（统计）"
+    )
+    field: str = Field(description="差异字段名")
+    expected: Optional[object] = Field(
+        description="按原始文件重新解析/配对应得到的值"
+    )
+    actual: Optional[object] = Field(description="入库的实际值")
+    radar: Optional[str] = Field(None, description="适用时：entry 或 exit")
+    observation_id: Optional[str] = Field(None, description="适用时：观测号")
+    entry_id: Optional[str] = Field(None, description="适用时：行程入口观测号")
+    exit_id: Optional[str] = Field(None, description="适用时：行程出口观测号")
+    detail: Optional[str] = Field(None, description="差异的人类可读说明")
+
+
+class VerificationOut(BaseModel):
+    version: int = Field(description="本次核验所读取的已提交轮次版本号")
+    created_at: str = Field(description="该轮次入库时间（UTC）")
+    status: str = Field(
+        description=(
+            "核验结论：verified（已核实、可交付）、"
+            "mismatch（有差异、不可交付）、"
+            "unverifiable（摘要不符或无法解析，无法核实）"
+        )
+    )
+    deliverable: bool = Field(
+        description="是否可交付：仅 status=verified 时为 true"
+    )
+    status_reason: str = Field(description="结论的中文说明")
+    digest_checks: List[DigestCheckOut] = Field(
+        description="两份原始雷达 CSV 的摘要核对结果"
+    )
+    parse_errors: List[str] = Field(
+        description="重新解析原始文件时的错误；为空表示两份文件均可解析"
+    )
+    differences: List[DifferenceOut] = Field(
+        description=(
+            "重新解析并按原规则配对后，与入库观测、已确认行程、待核原因及"
+            "统计的逐项差异；无法核实时为空（不能据库内行程判定可信）"
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -113,7 +169,12 @@ app = FastAPI(
         "|通行时长 - 5 分钟| 的总和。只有出现在**所有**最优配对中的行程才会交付，"
         "其余观测进入待核列表。\n\n"
         "每次成功上传整版替换旧结果；文件校验失败或写入失败时旧版本保持不变。"
-        "读取使用单一 SQLite 快照，不会混合新旧版本。"
+        "读取使用单一 SQLite 快照，不会混合新旧版本。\n\n"
+        "交付前可用 GET /api/rounds/current/verification 做只读核验："
+        "在同一已提交轮次的快照内重算原始 CSV 摘要、重新解析并按原规则配对，"
+        "对照入库观测、已确认行程、待核原因与统计。摘要不符或无法解析为"
+        "unverifiable（无法核实），存在差异为 mismatch（不可交付），"
+        "完全相符为 verified（可交付）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -363,3 +424,78 @@ def get_trips() -> List[dict]:
 )
 def get_pending() -> List[dict]:
     return _current_or_404().pending
+
+
+def _verification_payload(report) -> dict:
+    return {
+        "version": report.version,
+        "created_at": report.created_at,
+        "status": report.status,
+        "deliverable": report.deliverable,
+        "status_reason": report.status_reason,
+        "digest_checks": [
+            {
+                "radar": check.radar,
+                "filename": check.filename,
+                "recorded_sha256": check.recorded_sha256,
+                "actual_sha256": check.actual_sha256,
+                "recorded_size_bytes": check.recorded_size_bytes,
+                "actual_size_bytes": check.actual_size_bytes,
+                "sha256_ok": check.sha256_ok,
+                "size_ok": check.size_ok,
+            }
+            for check in report.digest_checks
+        ],
+        "parse_errors": list(report.parse_errors),
+        "differences": [
+            {
+                "scope": diff.scope,
+                "field": diff.field,
+                "expected": diff.expected,
+                "actual": diff.actual,
+                "radar": diff.radar,
+                "observation_id": diff.observation_id,
+                "entry_id": diff.entry_id,
+                "exit_id": diff.exit_id,
+                "detail": diff.detail,
+            }
+            for diff in report.differences
+        ],
+    }
+
+
+@app.get(
+    "/api/rounds/current/verification",
+    response_model=VerificationOut,
+    summary="只读核验：重算原始文件摘要并重解析配对，对照入库结果",
+    response_description=(
+        "所读轮次版本、摘要核对、解析错误与逐项差异；"
+        "verified 可交付，mismatch 不可交付，unverifiable 无法核实"
+    ),
+)
+def verify_current_round() -> dict:
+    """Verify the committed round this request reads.
+
+    All data for one verification comes from a single SQLite read snapshot,
+    so an upload replacing the round concurrently can never produce a report
+    mixing two rounds: the version field names the exact round verified.
+    The endpoint performs no writes.
+    """
+
+    try:
+        snapshot = storage.load_verification_snapshot()
+    except storage.StorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="尚未上传任何一轮数据")
+    report = verify_snapshot(snapshot)
+    logger.info(
+        "verification of round %s: status=%s, digest_failed=%s, "
+        "parse_errors=%d, differences=%d",
+        report.version,
+        report.status,
+        [c.radar for c in report.digest_checks if not c.ok],
+        len(report.parse_errors),
+        len(report.differences),
+    )
+    return _verification_payload(report)

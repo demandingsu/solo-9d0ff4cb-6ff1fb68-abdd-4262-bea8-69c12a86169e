@@ -98,6 +98,36 @@ class StoredRound:
     pending: List[dict]
 
 
+@dataclass(frozen=True)
+class StoredObservation:
+    observation_id: str
+    radar: str
+    utc_minute: int
+    status: str
+    pending_reason: Optional[str]
+
+
+@dataclass(frozen=True)
+class StoredTrip:
+    entry_id: str
+    exit_id: str
+    entry_minute: int
+    exit_minute: int
+    duration_seconds: int
+    deviation_seconds: int
+
+
+@dataclass(frozen=True)
+class VerificationSnapshot:
+    """Everything a read-only verification needs, taken from one snapshot."""
+
+    meta: RoundMeta
+    entry_csv: bytes
+    exit_csv: bytes
+    observations: List[StoredObservation]
+    trips: List[StoredTrip]
+
+
 def database_path() -> Path:
     return Path(os.environ.get("DATABASE_PATH", DEFAULT_DATABASE_PATH))
 
@@ -360,4 +390,85 @@ def load_current_round() -> Optional[StoredRound]:
         meta=meta,
         trips=trips,
         pending=[_pending_payload(p) for p in pending_rows],
+    )
+
+
+def load_verification_snapshot() -> Optional[VerificationSnapshot]:
+    """Load a full round (including the original CSV blobs) in one snapshot.
+
+    The verification endpoint must re-hash, re-parse and re-pair the exact
+    bytes that belong to one single committed round, even if an upload
+    replacement happens concurrently.  All rows are therefore read inside
+    one explicit read transaction, whose WAL snapshot cannot change under
+    a concurrent writer.
+    """
+
+    try:
+        with _read_snapshot() as conn:
+            row = conn.execute(
+                "SELECT * FROM rounds ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            version = int(row["version"])
+            observation_rows = conn.execute(
+                """
+                SELECT observation_id, radar, utc_minute, status, pending_reason
+                FROM observations WHERE version = ?
+                """,
+                (version,),
+            ).fetchall()
+            trip_rows = conn.execute(
+                """
+                SELECT entry_id, exit_id, entry_minute, exit_minute,
+                       duration_seconds, deviation_seconds
+                FROM trips WHERE version = ?
+                """,
+                (version,),
+            ).fetchall()
+            entry_csv = bytes(row["entry_csv"])
+            exit_csv = bytes(row["exit_csv"])
+    except sqlite3.Error as exc:
+        raise StorageError(f"failed to read round for verification: {exc}") from exc
+
+    meta = RoundMeta(
+        version=version,
+        created_at=row["created_at"],
+        entry_name=row["entry_name"],
+        exit_name=row["exit_name"],
+        entry_sha256=row["entry_sha256"],
+        exit_sha256=row["exit_sha256"],
+        entry_size=row["entry_size"],
+        exit_size=row["exit_size"],
+        max_trips=row["max_trips"],
+        min_deviation_seconds=row["min_deviation_seconds"],
+        optimal_matchings=row["optimal_matchings"],
+    )
+    observations = [
+        StoredObservation(
+            observation_id=obs_row["observation_id"],
+            radar=obs_row["radar"],
+            utc_minute=obs_row["utc_minute"],
+            status=obs_row["status"],
+            pending_reason=obs_row["pending_reason"],
+        )
+        for obs_row in observation_rows
+    ]
+    trips = [
+        StoredTrip(
+            entry_id=trip_row["entry_id"],
+            exit_id=trip_row["exit_id"],
+            entry_minute=trip_row["entry_minute"],
+            exit_minute=trip_row["exit_minute"],
+            duration_seconds=trip_row["duration_seconds"],
+            deviation_seconds=trip_row["deviation_seconds"],
+        )
+        for trip_row in trip_rows
+    ]
+    return VerificationSnapshot(
+        meta=meta,
+        entry_csv=entry_csv,
+        exit_csv=exit_csv,
+        observations=observations,
+        trips=trips,
     )

@@ -5,3 +5,6 @@ __pycache__/
 *.db-wal
 *.db-shm
 .venv/
+.tools/
+.uv-cache/
+.smoke/
